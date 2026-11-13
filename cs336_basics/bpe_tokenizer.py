@@ -1,31 +1,151 @@
 
 from __future__ import annotations
 
+
+from enum import unique
+import json
 import os
+import pickle
+import tempfile
+from typing import Iterable, Iterator
+from unicodedata import name
 import regex as re
+import tqdm
 from collections import defaultdict
 from .pretokenization_example import find_chunk_boundaries
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
-def process_chunk(args):
-    input_path, special_tokens, start, end = args
+class BPETokenizer:
+    def __init__(self,vocab:dict[int, bytes],
+                 merges: list[tuple[bytes, bytes]],
+                 special_tokens: list[str] = None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+        self.encoder: dict[bytes,int] = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
 
-    local_freq = {}
+        #Adding the special tokens
+        if special_tokens is not None:
+            for st in special_tokens:
+                cur_st_encoding = st.encode("utf-8")
 
-    with open(input_path, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8")
+                if cur_st_encoding not in self.encoder:
+                    idx = len(self.vocab)
+                    self.vocab[idx] = cur_st_encoding
+                    self.encoder[cur_st_encoding] = idx
 
-    get_frequencies(
-        chunk=chunk,
-        freq_table=local_freq,
-        special_tokens=special_tokens
-    )
 
-    return local_freq
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None) -> "BPETokenizer":
+        with open(vocab_filepath, "r", encoding="utf-8") as vocab_f:
+            raw_vocab = json.load(vocab_f)
+
+        # Convert string keys directly to UTF-8 bytes
+        vocab = {
+            int(vocab_index): vocab_item.encode("utf-8")
+            for vocab_item, vocab_index in raw_vocab.items()
+        }
+
+        # Add missing special tokens cleanly without duplicate checks slowing down
+        if special_tokens:
+            existing_bytes = set(vocab.values())
+            for special_token in dict.fromkeys(special_tokens):
+                byte_encoded = special_token.encode("utf-8")
+                if byte_encoded not in existing_bytes:
+                    vocab[len(vocab)] = byte_encoded
+                    existing_bytes.add(byte_encoded)
+
+        merges = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                # Strip only newlines so space tokens aren't lost
+                cleaned_line = line.rstrip("\r\n")
+                if cleaned_line and len(cleaned_line.split(" ")) == 2:
+                    t1, t2 = cleaned_line.split(" ")
+                    merges.append((t1.encode("utf-8"), t2.encode("utf-8")))
+
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+    
+    def encode(self, text:str) -> list[int]:
+
+        if len(text) == 0:
+            return []
+        
+        #pretokenize
+        freq_table:dict[tuple[bytes,...],int] = {}
+        get_frequencies(chunk=text,freq_table=freq_table,special_tokens=self.special_tokens)
+        unique_words = list(freq_table.keys())
+        # word_counts = [freq_table[w] for w in unique_words]
+        del freq_table
+        #apply the merges
+        og_word_to_new_word:dict[tuple[bytes,...],tuple[bytes,...]] = {}
+        for w in unique_words:
+            temp_w = list(w)
+            for m in self.merges:
+                i = 0
+                new_token = m[0] + m[1]
+                cur_w = []
+                while i < len(temp_w):
+                    if (
+                        i < len(temp_w) - 1
+                        and (temp_w[i], temp_w[i + 1]) == m
+                    ):
+                        cur_w.append(new_token)
+                        i += 2
+        
+                    else:
+                        cur_w.append(temp_w[i])
+                        i += 1
+                temp_w = cur_w
+        
+            og_word_to_new_word[w] = tuple(temp_w)
+
+        #turn the text to idx
+        idx_encoding:list[int] = []
+        if self.special_tokens:
+            sorted_specials = sorted(self.special_tokens, key=len, reverse=True)
+            special_pattern = "(" + "|".join(re.escape(token) for token in sorted_specials) + ")"
+            mini_chunks = re.split(special_pattern, text)
+        else:
+            mini_chunks = [text]
+    
+        for mc in mini_chunks:
+            if not mc:
+                continue
+                
+            if self.special_tokens is not None and mc in self.special_tokens:
+                # Handle special token directly as a single ID (do NOT split with PAT)
+                idx_encoding.append(self.encoder[mc.encode('utf-8')])
+            else:
+                # Normal text: split with PAT and run BPE
+                for cur in re.finditer(PAT, mc):
+                    word = tuple(bytes([b]) for b in cur.group().encode('utf-8'))
+                    new_word = og_word_to_new_word[word]
+                    for byte in new_word:
+                        idx_encoding.append(self.encoder[byte])  
+
+        return idx_encoding      
+                
+
+                
+        
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for text_chunk in iterable:
+            # Yields each token ID one by one from encode()
+            yield from self.encode(text_chunk)
+
+    def decode(self, ids: list[int]) -> str:
+        raw_bytes = b"".join(self.vocab[token_id] for token_id in ids)
+    
+        return raw_bytes.decode("utf-8", errors="replace")
+        
 
 
 def train_bpe(
@@ -55,42 +175,7 @@ def train_bpe(
 
     # 2. Pre-tokenize corpus
     
-    num_processes = kwargs.get(
-        "num_processes",
-        os.cpu_count() or 1
-    )
-
-    input_path = os.fspath(input_path)
-
-    with open(input_path, "rb") as f:
-
-        boundaries = find_chunk_boundaries(
-            f,
-            num_processes,
-            b"<|endoftext|>"
-        )
-
-    tasks = [
-        (input_path, special_tokens, start, end)
-        for start, end in zip(boundaries[:-1], boundaries[1:])
-    ]
-
-    freq = {}
-
-    with ProcessPoolExecutor(
-        max_workers=num_processes
-    ) as executor:
-
-        for local_freq in executor.map(process_chunk, tasks):
-
-            for word, count in local_freq.items():
-
-                freq[word] = freq.get(word, 0) + count
-
-
-    # 3. Convert unique pre-tokens into indexed lists
-    unique_words = list(freq.keys())
-    word_counts = [freq[w] for w in unique_words]
+    unique_words , word_counts = pretokenize(input_path=input_path,special_tokens=special_tokens,**kwargs)
 
     # 4. Initialize pair counts and inverted index
     pair_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
@@ -109,6 +194,8 @@ def train_bpe(
             inverted_index[pair].add(w_idx)
 
     # 5. BPE merging iterations
+
+    pbar = tqdm.tqdm(total=(vocab_size-current_vocab_sz),desc="Training BPE Tokenizer")
     while current_vocab_sz < vocab_size:
 
         if not pair_counts:
@@ -132,6 +219,7 @@ def train_bpe(
 
         merged_index = current_vocab_sz
         current_vocab_sz += 1
+        pbar.update(n=1)
 
         # Only update words containing the selected pair
         words_to_update = list(inverted_index[best_pair])
@@ -146,8 +234,106 @@ def train_bpe(
             inverted_index=inverted_index
         )
 
+    pbar.close()
     return vocab, merges
 
+
+
+def process_chunk(args):
+    input_path, special_tokens, start, end, output_path = args
+
+    local_freq = {}
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8")
+
+    get_frequencies(
+        chunk=chunk,
+        freq_table=local_freq,
+        special_tokens=special_tokens
+    )
+
+    with open(output_path, "wb") as f:
+        pickle.dump(local_freq, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    del local_freq
+    return output_path
+
+def pretokenize(
+    input_path,
+    special_tokens,
+    **kwargs    
+)-> tuple[list[tuple[bytes, ...]],list[int]]:
+    
+    num_processes = min(
+        kwargs.get("num_processes", 2),
+        os.cpu_count() or 1,
+        2
+    )
+
+    # Small chunks reduce peak worker memory.
+    num_chunks = 64
+
+    input_path = os.fspath(input_path)
+    freq = {}
+
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(
+            f,
+            num_chunks,
+            b"<|endoftext|>"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="bpe_") as tmpdir:
+
+        tasks = [
+            (
+                input_path,
+                special_tokens,
+                start,
+                end,
+                os.path.join(tmpdir, f"chunk_{i}.pkl")
+            )
+            for i, (start, end) in enumerate(
+                zip(boundaries[:-1], boundaries[1:])
+            )
+        ]
+
+        with ProcessPoolExecutor(
+            max_workers=num_processes,
+            mp_context=mp.get_context("spawn")
+        ) as executor:
+
+            futures = [
+                executor.submit(process_chunk, task)
+                for task in tasks
+            ]
+
+            with tqdm.tqdm(total=len(futures), desc="Pretokenizer") as pbar:
+
+                for future in as_completed(futures):
+
+                    output_path = future.result()
+
+                    with open(output_path, "rb") as f:
+                        local_freq = pickle.load(f)
+
+                    for word, count in local_freq.items():
+                        freq[word] = freq.get(word, 0) + count
+
+                    del local_freq
+                    os.remove(output_path)
+
+                    pbar.update(1)
+
+    # 3. Convert unique pre-tokens into indexed lists
+    unique_words = list(freq.keys())
+    word_counts = [freq[w] for w in unique_words]
+
+    del freq
+
+    return unique_words , word_counts
 
 def update_table(
     unique_words: list[tuple[bytes, ...]],
@@ -220,7 +406,8 @@ def get_frequencies(
     special_tokens: list[str]
 ):
     if special_tokens:
-        special_pattern = "|".join(re.escape(token) for token in special_tokens)
+        sorted_specials = sorted(special_tokens, key=len, reverse=True)
+        special_pattern = "|".join(re.escape(token) for token in sorted_specials)
         mini_chunks = re.split(special_pattern, chunk)
     else:
         mini_chunks = [chunk]

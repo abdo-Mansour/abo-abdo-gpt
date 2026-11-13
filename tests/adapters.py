@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from random import vonmisesvariate
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
@@ -561,7 +562,9 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return bpe_tokenizer.BPETokenizer(vocab=vocab,
+                                      merges=merges,
+                                      special_tokens=special_tokens)
 
 
 
