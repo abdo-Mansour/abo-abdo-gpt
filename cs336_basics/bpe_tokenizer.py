@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import unique
 import json
+import base64
 import os
 import pickle
 import tempfile
@@ -40,34 +41,62 @@ class BPETokenizer:
 
 
 
+
     @classmethod
-    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None) -> "BPETokenizer":
-        with open(vocab_filepath, "r", encoding="utf-8") as vocab_f:
-            raw_vocab = json.load(vocab_f)
+    def from_files(
+        cls,
+        vocab_filepath: str | os.PathLike,
+        merges_filepath: str | os.PathLike,
+        special_tokens: list[str] | None = None,
+    ) -> "BPETokenizer":
+        """Load a tokenizer saved by save_bpe_files().
 
-        # Convert string keys directly to UTF-8 bytes
-        vocab = {
-            int(vocab_index): vocab_item.encode("utf-8")
-            for vocab_item, vocab_index in raw_vocab.items()
-        }
+        The base64 format preserves arbitrary byte tokens, including tokens
+        that are not valid UTF-8. A legacy UTF-8 JSON/text format is also
+        accepted for compatibility with older files.
+        """
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            raw_vocab = json.load(f)
 
-        # Add missing special tokens cleanly without duplicate checks slowing down
-        if special_tokens:
-            existing_bytes = set(vocab.values())
-            for special_token in dict.fromkeys(special_tokens):
-                byte_encoded = special_token.encode("utf-8")
-                if byte_encoded not in existing_bytes:
-                    vocab[len(vocab)] = byte_encoded
-                    existing_bytes.add(byte_encoded)
+        if isinstance(raw_vocab, dict) and raw_vocab.get("format") == "byte-bpe-base64-v1":
+            vocab = {
+                int(token_id): base64.b64decode(token_b64, validate=True)
+                for token_id, token_b64 in raw_vocab["vocab"].items()
+            }
+        else:
+            # Legacy format: {token_as_utf8_string: token_id}.
+            vocab = {
+                int(token_id): token.encode("utf-8")
+                for token, token_id in raw_vocab.items()
+            }
 
-        merges = []
         with open(merges_filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                # Strip only newlines so space tokens aren't lost
-                cleaned_line = line.rstrip("\r\n")
-                if cleaned_line and len(cleaned_line.split(" ")) == 2:
-                    t1, t2 = cleaned_line.split(" ")
-                    merges.append((t1.encode("utf-8"), t2.encode("utf-8")))
+            merge_lines = f.read().splitlines()
+
+        # Text format: a header followed by two base64-encoded byte tokens
+        # per line. Base64 keeps arbitrary byte sequences reversible while
+        # retaining the conventional one-merge-per-line .txt layout.
+        if merge_lines and merge_lines[0].strip() == "# byte-bpe-base64-v1":
+            merges = []
+            for line_number, line in enumerate(merge_lines[1:], start=2):
+                if not line.strip() or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"Invalid merge at {merges_filepath}:{line_number}; expected two base64 tokens"
+                    )
+                merges.append((
+                    base64.b64decode(parts[0], validate=True),
+                    base64.b64decode(parts[1], validate=True),
+                ))
+        else:
+            # Legacy format: one pair of UTF-8 strings per line.
+            merges = []
+            for line in merge_lines:
+                parts = line.split(" ")
+                if len(parts) == 2:
+                    merges.append((parts[0].encode("utf-8"), parts[1].encode("utf-8")))
 
         return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
@@ -419,3 +448,37 @@ def get_frequencies(
                 freq_table[word] = 1
             else:
                 freq_table[word] += 1
+
+
+def save_bpe_files(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    vocab_filepath: str | os.PathLike,
+    merges_filepath: str | os.PathLike,
+) -> None:
+    """Save a trained byte-level BPE vocabulary and merges for from_files().
+
+    The vocabulary is stored as JSON. Merges are stored as a readable .txt
+    file with one pair per line; each token is base64-encoded because BPE
+    tokens are arbitrary byte strings and are not necessarily valid UTF-8.
+    Both files can be loaded with BPETokenizer.from_files().
+    """
+    vocab_path = os.fspath(vocab_filepath)
+    merges_path = os.fspath(merges_filepath)
+
+    vocab_payload = {
+        "format": "byte-bpe-base64-v1",
+        "vocab": {
+            str(token_id): base64.b64encode(token_bytes).decode("ascii")
+            for token_id, token_bytes in sorted(vocab.items())
+        },
+    }
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(vocab_payload, f, ensure_ascii=True, indent=2)
+
+    with open(merges_path, "w", encoding="utf-8") as f:
+        f.write("# byte-bpe-base64-v1\n")
+        for left, right in merges:
+            left_b64 = base64.b64encode(left).decode("ascii")
+            right_b64 = base64.b64encode(right).decode("ascii")
+            f.write(f"{left_b64} {right_b64}\n")
